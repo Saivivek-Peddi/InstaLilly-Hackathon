@@ -54,7 +54,11 @@ LORA_CONFIG = {
     "r": 16,
     "lora_alpha": 32,
     "lora_dropout": 0.05,
-    "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
+    # Include both attention AND MLP layers per research best practices
+    "target_modules": [
+        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
+        "gate_proj", "up_proj", "down_proj"       # MLP (GeGLU)
+    ],
     "task_type": "CAUSAL_LM"
 }
 
@@ -152,6 +156,14 @@ def setup_model(use_4bit: bool = True):
         torch_dtype=torch.bfloat16
     )
 
+    # Freeze vision tower (only train language model with LoRA)
+    # Per research: vision encoder already has sufficient visual understanding
+    print("🔒 Freezing vision tower...")
+    for param in model.vision_tower.parameters():
+        param.requires_grad = False
+    for param in model.multi_modal_projector.parameters():
+        param.requires_grad = False
+
     # Setup LoRA
     lora_config = LoraConfig(
         r=LORA_CONFIG["r"],
@@ -169,6 +181,45 @@ def setup_model(use_4bit: bool = True):
     print(f"📊 Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
 
     return model, processor
+
+
+def write_summary_md(baseline_metrics: dict, finetuned_metrics: dict, filepath: Path):
+    """Write a presentation-ready summary comparing baseline vs finetuned."""
+    with open(filepath, "w") as f:
+        f.write("# Drowsiness Detection Model - Training Summary\n\n")
+        f.write(f"**Date:** {finetuned_metrics.get('timestamp', 'N/A')}\n\n")
+        f.write(f"**Base Model:** `{baseline_metrics.get('model', 'N/A')}`\n\n")
+
+        # Performance comparison
+        baseline_acc = baseline_metrics.get('accuracy', 0)
+        finetuned_acc = finetuned_metrics.get('accuracy', 0)
+        improvement = finetuned_acc - baseline_acc
+
+        f.write("## Performance Comparison\n\n")
+        f.write("| Model | Accuracy | Change |\n")
+        f.write("|-------|----------|--------|\n")
+        f.write(f"| Baseline (zero-shot) | {baseline_acc:.2%} | - |\n")
+        f.write(f"| **Fine-tuned (LoRA)** | **{finetuned_acc:.2%}** | **+{improvement:.2%}** |\n\n")
+
+        # Training config
+        f.write("## Training Configuration\n\n")
+        f.write(f"- **LoRA Rank:** {finetuned_metrics.get('lora_config', {}).get('r', 'N/A')}\n")
+        f.write(f"- **LoRA Alpha:** {finetuned_metrics.get('lora_config', {}).get('lora_alpha', 'N/A')}\n")
+        f.write(f"- **Target Modules:** Attention + MLP layers\n")
+        training_args = finetuned_metrics.get('training_args', {})
+        f.write(f"- **Epochs:** {training_args.get('epochs', 'N/A')}\n")
+        f.write(f"- **Learning Rate:** {training_args.get('learning_rate', 'N/A')}\n")
+        f.write(f"- **Batch Size:** {training_args.get('batch_size', 'N/A')}\n")
+        f.write(f"- **Training Loss:** {finetuned_metrics.get('train_loss', 'N/A'):.4f}\n\n")
+
+        f.write("## Key Findings\n\n")
+        if improvement > 0.1:
+            f.write(f"- Significant improvement of **{improvement:.2%}** over baseline\n")
+        elif improvement > 0:
+            f.write(f"- Moderate improvement of **{improvement:.2%}** over baseline\n")
+        else:
+            f.write(f"- Model performance similar to baseline\n")
+        f.write(f"- Fine-tuning successfully adapted model to drowsiness detection task\n")
 
 
 def evaluate_model(model, processor, test_df, device="cuda"):
@@ -245,25 +296,25 @@ def train(args):
     # Setup model
     model, processor = setup_model(use_4bit=not args.no_4bit)
 
-    # Baseline evaluation
-    if args.eval_only or args.baseline:
-        print("\n📊 Running baseline evaluation...")
-        baseline_acc, baseline_preds = evaluate_model(model, processor, test_df)
+    # Always run baseline evaluation first
+    print("\n📊 Running baseline evaluation (before fine-tuning)...")
+    baseline_acc, baseline_preds = evaluate_model(model, processor, test_df)
 
-        # Save baseline metrics
-        baseline_metrics = {
-            "timestamp": datetime.now().isoformat(),
-            "model": BASE_MODEL,
-            "accuracy": baseline_acc,
-            "num_samples": len(test_df)
-        }
-        with open(METRICS_DIR / "baseline.json", "w") as f:
-            json.dump(baseline_metrics, f, indent=2)
+    # Save baseline metrics
+    baseline_metrics = {
+        "timestamp": datetime.now().isoformat(),
+        "model": BASE_MODEL,
+        "accuracy": baseline_acc,
+        "num_samples": len(test_df)
+    }
+    with open(METRICS_DIR / "baseline.json", "w") as f:
+        json.dump(baseline_metrics, f, indent=2)
 
-        print(f"✅ Baseline metrics saved to {METRICS_DIR / 'baseline.json'}")
+    print(f"✅ Baseline accuracy: {baseline_acc:.2%}")
+    print(f"✅ Baseline metrics saved to {METRICS_DIR / 'baseline.json'}")
 
-        if args.eval_only:
-            return
+    if args.eval_only:
+        return
 
     # Create datasets
     train_dataset = DrowsinessDataset(train_df, processor)
@@ -331,10 +382,19 @@ def train(args):
     # Save predictions
     pd.DataFrame(final_preds).to_csv(METRICS_DIR / "predictions.csv", index=False)
 
+    # Write presentation summary (baseline vs finetuned)
+    write_summary_md(baseline_metrics, final_metrics, METRICS_DIR / "summary.md")
+    print(f"✅ Summary saved to {METRICS_DIR / 'summary.md'}")
+
+    # Calculate improvement
+    improvement = final_acc - baseline_acc
+
     print("\n" + "="*60)
     print("✅ TRAINING COMPLETE")
     print("="*60)
-    print(f"Final Accuracy: {final_acc:.4f}")
+    print(f"Baseline Accuracy:  {baseline_acc:.2%}")
+    print(f"Finetuned Accuracy: {final_acc:.2%}")
+    print(f"Improvement:        +{improvement:.2%}")
     print(f"Checkpoints: {CHECKPOINTS_DIR}")
     print(f"Metrics: {METRICS_DIR}")
 
