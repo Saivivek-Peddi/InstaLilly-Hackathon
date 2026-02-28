@@ -30,10 +30,25 @@ uv.lock
 *.pth
 *.ckpt
 
-# Data (download separately)
+# Data (download separately - large files)
 models/*/data/*.zip
 models/*/data/*.tar.gz
 models/*/data/raw/
+
+# Downloaded datasets (too large for git)
+models/drowsiness_detector/data/ddd/
+models/drowsiness_detector/data/mrl_eyes/
+models/drowsiness_detector/data/fl3d/
+models/drowsiness_detector/data/drowsiness_extra/
+models/distraction_detector/data/distraction_alt/
+models/distraction_detector/data/state_farm/
+
+# Processed data
+models/*/data/processed/
+
+# Model checkpoints directories
+models/*/checkpoints/
+models/*/metrics/
 
 # Secrets
 .env
