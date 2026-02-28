@@ -2,19 +2,14 @@
 """
 Data Preparation for Distraction Detection Model
 
-Processes State Farm Distracted Driver Detection dataset.
+Processes Revitsone-5classes driver distraction dataset.
 
-Classes (10 total):
-- c0: safe driving
-- c1: texting - right
-- c2: talking on the phone - right
-- c3: texting - left
-- c4: talking on the phone - left
-- c5: operating the radio
-- c6: drinking
-- c7: reaching behind
-- c8: hair and makeup
-- c9: talking to passenger
+Classes (5 total):
+- safe_driving: Driver focused on road
+- texting_phone: Driver texting on phone
+- talking_phone: Driver talking on phone
+- other_activities: Other distracting activities
+- turning: Driver turning/looking away
 
 Output format:
 - images/ folder with processed images
@@ -37,113 +32,78 @@ DATA_DIR = MODEL_DIR / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 IMAGES_DIR = PROCESSED_DIR / "images"
 
-# Class mapping for State Farm dataset
+# Class mapping for Revitsone-5classes dataset
 CLASSES = [
-    "safe_driving",      # c0
-    "texting_right",     # c1
-    "phone_right",       # c2
-    "texting_left",      # c3
-    "phone_left",        # c4
-    "operating_radio",   # c5
-    "drinking",          # c6
-    "reaching_behind",   # c7
-    "hair_makeup",       # c8
-    "talking_passenger"  # c9
+    "safe_driving",
+    "texting_phone",
+    "talking_phone",
+    "other_activities",
+    "turning"
 ]
 
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 
-# Map State Farm folder names to our classes
-SF_TO_CLASS = {
-    "c0": "safe_driving",
-    "c1": "texting_right",
-    "c2": "phone_right",
-    "c3": "texting_left",
-    "c4": "phone_left",
-    "c5": "operating_radio",
-    "c6": "drinking",
-    "c7": "reaching_behind",
-    "c8": "hair_makeup",
-    "c9": "talking_passenger"
-}
-
 # Human-readable descriptions
 CLASS_DESCRIPTIONS = {
     "safe_driving": "Driver is focused on the road with both hands on the steering wheel",
-    "texting_right": "Driver is texting using their right hand",
-    "phone_right": "Driver is talking on the phone held in their right hand",
-    "texting_left": "Driver is texting using their left hand",
-    "phone_left": "Driver is talking on the phone held in their left hand",
-    "operating_radio": "Driver is adjusting the radio or dashboard controls",
-    "drinking": "Driver is drinking a beverage",
-    "reaching_behind": "Driver is reaching behind to the back seat",
-    "hair_makeup": "Driver is adjusting hair or applying makeup",
-    "talking_passenger": "Driver is turned talking to a passenger"
+    "texting_phone": "Driver is texting on their phone",
+    "talking_phone": "Driver is talking on the phone",
+    "other_activities": "Driver is engaged in other distracting activities",
+    "turning": "Driver is turning or looking away from the road"
 }
 
 # Image size for model
 TARGET_SIZE = (224, 224)
 
 
-def process_state_farm_dataset():
-    """Process State Farm Distracted Driver dataset."""
-    sf_dir = DATA_DIR / "state_farm"
-    if not sf_dir.exists():
-        print("⚠️  State Farm dataset not found. Run download script first.")
+def process_revitsone_dataset():
+    """Process Revitsone-5classes driver distraction dataset."""
+    # Look for the dataset in distraction_alt folder
+    revitsone_dir = DATA_DIR / "distraction_alt" / "Revitsone-5classes"
+
+    # Handle nested structure
+    if not revitsone_dir.exists():
+        revitsone_dir = DATA_DIR / "distraction_alt" / "Revitsone-5classes" / "Revitsone-5classes"
+
+    if not revitsone_dir.exists():
+        print("⚠️  Revitsone dataset not found. Run download script first.")
         return []
 
     records = []
-    print("📁 Processing State Farm dataset...")
+    print("📁 Processing Revitsone-5classes dataset...")
+    print(f"   Found directory: {revitsone_dir}")
 
-    # Look for train folder
-    train_dir = None
-    for possible_path in [sf_dir / "train", sf_dir / "imgs" / "train", sf_dir]:
-        if possible_path.exists():
-            # Check if it has c0, c1, etc. folders
-            if any((possible_path / f"c{i}").exists() for i in range(10)):
-                train_dir = possible_path
-                break
-
-    if train_dir is None:
-        # Search recursively
-        for folder in sf_dir.rglob("c0"):
-            if folder.is_dir():
-                train_dir = folder.parent
-                break
-
-    if train_dir is None:
-        print("⚠️  Could not find State Farm train folder structure")
-        print(f"   Looking in: {sf_dir}")
-        print(f"   Contents: {list(sf_dir.iterdir())[:10]}")
-        return []
-
-    print(f"   Found train directory: {train_dir}")
+    # Map folder names to our classes
+    folder_to_class = {
+        "safe_driving": "safe_driving",
+        "texting_phone": "texting_phone",
+        "talking_phone": "talking_phone",
+        "other_activities": "other_activities",
+        "turning": "turning"
+    }
 
     # Process each class folder
-    for class_idx in range(10):
-        class_folder = train_dir / f"c{class_idx}"
+    for folder_name, label in folder_to_class.items():
+        class_folder = revitsone_dir / folder_name
         if not class_folder.exists():
+            print(f"   ⚠️  Folder not found: {folder_name}")
             continue
-
-        label = SF_TO_CLASS[f"c{class_idx}"]
 
         for img_path in class_folder.glob("*.jpg"):
             records.append({
-                "source": "state_farm",
+                "source": "revitsone",
                 "original_path": str(img_path),
-                "label": label,
-                "original_class": f"c{class_idx}"
+                "label": label
             })
 
         for img_path in class_folder.glob("*.png"):
             records.append({
-                "source": "state_farm",
+                "source": "revitsone",
                 "original_path": str(img_path),
-                "label": label,
-                "original_class": f"c{class_idx}"
+                "label": label
             })
 
-    print(f"  Found {len(records)} images from State Farm")
+    print(f"  Found {len(records)} images from Revitsone")
 
     # Print per-class counts
     from collections import Counter
@@ -183,8 +143,7 @@ def copy_and_resize_images(records: list) -> list:
                 "path": str(new_path),
                 "label": record["label"],
                 "label_idx": CLASS_TO_IDX[record["label"]],
-                "source": record["source"],
-                "description": CLASS_DESCRIPTIONS[record["label"]]
+                "source": record["source"]
             })
 
         except Exception as e:
@@ -223,15 +182,10 @@ def create_prompt_dataset(df: pd.DataFrame):
 
 Categories:
 - safe_driving: Focused on driving with hands on wheel
-- texting_right: Using phone to text with right hand
-- texting_left: Using phone to text with left hand
-- phone_right: Talking on phone held in right hand
-- phone_left: Talking on phone held in left hand
-- operating_radio: Adjusting radio/dashboard controls
-- drinking: Drinking a beverage
-- reaching_behind: Reaching to back seat
-- hair_makeup: Fixing hair or makeup
-- talking_passenger: Turned talking to passenger
+- texting_phone: Using phone to text
+- talking_phone: Talking on phone
+- other_activities: Other distracting activities
+- turning: Turning or looking away from road
 
 Output the activity type, risk level, and recommended action."""
 
@@ -245,28 +199,18 @@ Recommended Action: {action}"""
 
     risk_levels = {
         "safe_driving": "low",
-        "texting_right": "high",
-        "phone_right": "medium",
-        "texting_left": "high",
-        "phone_left": "medium",
-        "operating_radio": "low",
-        "drinking": "low",
-        "reaching_behind": "high",
-        "hair_makeup": "medium",
-        "talking_passenger": "medium"
+        "texting_phone": "high",
+        "talking_phone": "medium",
+        "other_activities": "medium",
+        "turning": "medium"
     }
 
     actions = {
         "safe_driving": "Continue safe driving practices.",
-        "texting_right": "⚠️ Please stop texting. I can read messages for you.",
-        "phone_right": "Consider using hands-free mode for calls.",
-        "texting_left": "⚠️ Please stop texting. I can read messages for you.",
-        "phone_left": "Consider using hands-free mode for calls.",
-        "operating_radio": "Keep adjustments brief. I can help with controls.",
-        "drinking": "Place beverage in holder when not drinking.",
-        "reaching_behind": "⚠️ Pull over safely if you need to reach behind.",
-        "hair_makeup": "Please focus on driving. Adjust appearance when parked.",
-        "talking_passenger": "Keep eyes on the road while conversing."
+        "texting_phone": "Please stop texting. I can read messages for you.",
+        "talking_phone": "Consider using hands-free mode for calls.",
+        "other_activities": "Please focus on driving.",
+        "turning": "Keep eyes on the road ahead."
     }
 
     prompts = []
@@ -277,7 +221,7 @@ Recommended Action: {action}"""
             "prompt": prompt_template,
             "response": response_template.format(
                 label=row["label"],
-                description=row["description"],
+                description=CLASS_DESCRIPTIONS[row["label"]],
                 risk_level=risk_levels[row["label"]],
                 action=actions[row["label"]]
             ),
@@ -294,13 +238,11 @@ def main():
     print("="*60)
 
     # Collect records
-    all_records = process_state_farm_dataset()
+    all_records = process_revitsone_dataset()
 
     if not all_records:
-        print("\n❌ No data found. Please run the download script first:")
-        print("   python scripts/download_data.py --model distraction")
-        print("\n   Note: You may need to accept competition rules at:")
-        print("   https://www.kaggle.com/c/state-farm-distracted-driver-detection")
+        print("\n❌ No data found. Please download the dataset first:")
+        print("   kaggle datasets download -d robinreni/revitsone-5class")
         return
 
     print(f"\n📊 Total records found: {len(all_records)}")

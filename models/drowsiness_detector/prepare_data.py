@@ -107,7 +107,7 @@ def process_mrl_dataset():
 
 def process_fl3d_dataset():
     """Process FL3D (Frame-Level Driver Drowsiness Detection) dataset."""
-    fl3d_dir = DATA_DIR / "fl3d"
+    fl3d_dir = DATA_DIR / "fl3d" / "classification_frames"
     if not fl3d_dir.exists():
         print("⚠️  FL3D dataset not found. Run download script first.")
         return []
@@ -115,26 +115,69 @@ def process_fl3d_dataset():
     records = []
     print("📁 Processing FL3D dataset...")
 
-    # FL3D structure varies - look for common patterns
-    for img_path in fl3d_dir.rglob("*.*"):
-        if img_path.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-            # Try to infer label from path or filename
-            path_str = str(img_path).lower()
-            if "drowsy" in path_str or "sleepy" in path_str:
+    # FL3D has participant folders with annotations_final.json
+    for participant_dir in fl3d_dir.iterdir():
+        if not participant_dir.is_dir():
+            continue
+
+        annotations_file = participant_dir / "annotations_final.json"
+        if not annotations_file.exists():
+            continue
+
+        # Load annotations
+        with open(annotations_file) as f:
+            annotations = json.load(f)
+
+        for filename, data in annotations.items():
+            img_path = participant_dir / filename
+            if not img_path.exists():
+                continue
+
+            # Map FL3D states to our classes
+            driver_state = data.get("driver_state", "").lower()
+            if driver_state == "alert":
+                label = "alert"
+            elif driver_state in ["drowsy", "sleepy"]:
                 label = "drowsy"
-            elif "yawn" in path_str:
+            elif "yawn" in driver_state:
                 label = "yawning"
-            elif "close" in path_str:
-                label = "eyes_closed"
-            elif "alert" in path_str or "awake" in path_str or "normal" in path_str:
-                label = "alert"
             else:
-                # Default to alert if unclear
-                label = "alert"
+                label = "alert"  # Default
 
             records.append({"source": "fl3d", "original_path": str(img_path), "label": label})
 
     print(f"  Found {len(records)} images from FL3D")
+    return records
+
+
+def process_drowsiness_extra_dataset():
+    """Process drowsiness extra dataset with eyes and yawn classes."""
+    extra_dir = DATA_DIR / "drowsiness_extra" / "train"
+    if not extra_dir.exists():
+        print("⚠️  Drowsiness extra dataset not found.")
+        return []
+
+    records = []
+    print("📁 Processing Drowsiness Extra dataset...")
+
+    # Map folder names to our classes
+    folder_mapping = {
+        "Closed": "eyes_closed",
+        "Open": "alert",
+        "yawn": "yawning",
+        "no_yawn": "alert"
+    }
+
+    for folder_name, label in folder_mapping.items():
+        folder_path = extra_dir / folder_name
+        if not folder_path.exists():
+            continue
+
+        for img_path in folder_path.glob("*.*"):
+            if img_path.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                records.append({"source": "drowsiness_extra", "original_path": str(img_path), "label": label})
+
+    print(f"  Found {len(records)} images from Drowsiness Extra")
     return records
 
 
@@ -254,6 +297,7 @@ def main():
     all_records.extend(process_ddd_dataset())
     all_records.extend(process_mrl_dataset())
     all_records.extend(process_fl3d_dataset())
+    all_records.extend(process_drowsiness_extra_dataset())
 
     if not all_records:
         print("\n❌ No data found. Please run the download script first:")
