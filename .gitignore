@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# UV
+.uv/
+uv.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Model checkpoints (large files)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Data (download separately)
+models/*/data/*.zip
+models/*/data/*.tar.gz
+models/*/data/raw/
+
+# Secrets
+.env
+*.pem
+credentials.json
+
+# Logs
+*.log
+logs/
+
+# Temporary
+tmp/
+temp/
+*.tmp
+reference/
+logic.txt
+.claude/
