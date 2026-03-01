@@ -134,7 +134,10 @@ def process_fl3d_dataset():
                 continue
 
             # Map FL3D states to our classes
-            driver_state = data.get("driver_state", "").lower()
+            driver_state = data.get("driver_state") if data else None
+            if driver_state is None:
+                continue
+            driver_state = driver_state.lower()
             if driver_state == "alert":
                 label = "alert"
             elif driver_state in ["drowsy", "sleepy"]:

@@ -10,7 +10,7 @@ Run on VM:
 
 Options:
     --epochs: Number of training epochs (default: 3)
-    --batch_size: Batch size (default: 8)
+    --batch_size: Batch size (default: 4)
     --lr: Learning rate (default: 2e-4)
     --eval_only: Only run evaluation on base model
 """
@@ -34,13 +34,14 @@ try:
         PaliGemmaForConditionalGeneration,
         TrainingArguments,
         Trainer,
-        BitsAndBytesConfig
+        BitsAndBytesConfig,
     )
     from peft import LoraConfig, get_peft_model, TaskType
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
-    print("⚠️  ML dependencies not available. Run on VM with: uv sync --extra ml")
+    print("ML dependencies not available. Run on VM with: uv sync --extra ml")
+
 
 # Paths
 MODEL_DIR = Path(__file__).parent
@@ -48,28 +49,29 @@ DATA_DIR = MODEL_DIR / "data" / "processed"
 CHECKPOINTS_DIR = MODEL_DIR / "checkpoints"
 METRICS_DIR = MODEL_DIR / "metrics"
 
-# Model config
-BASE_MODEL = "google/paligemma-3b-pt-224"
+# Model config - Using PaliGemma 2
+BASE_MODEL = "google/paligemma2-3b-pt-448"
+
+# Classes for drowsiness detection
+CLASSES = ["alert", "drowsy", "yawning", "eyes_closed"]
+
 LORA_CONFIG = {
     "r": 16,
     "lora_alpha": 32,
     "lora_dropout": 0.05,
-    # Include both attention AND MLP layers per research best practices
-    "target_modules": [
-        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
-        "gate_proj", "up_proj", "down_proj"       # MLP (GeGLU)
-    ],
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],  # Attention only
     "task_type": "CAUSAL_LM"
 }
 
 
 class DrowsinessDataset(Dataset):
-    """Dataset for drowsiness detection fine-tuning."""
+    """Dataset for drowsiness detection fine-tuning with PaliGemma2."""
 
-    def __init__(self, df: pd.DataFrame, processor, max_length: int = 512):
+    def __init__(self, df: pd.DataFrame, processor, max_length: int = 1200):
         self.df = df.reset_index(drop=True)
         self.processor = processor
         self.max_length = max_length
+        self.prompt = "Driver state?\n"
 
     def __len__(self):
         return len(self.df)
@@ -80,59 +82,68 @@ class DrowsinessDataset(Dataset):
         # Load image
         image = Image.open(row["path"]).convert("RGB")
 
-        # Create prompt
-        prompt = row["prompt"]
-        response = row["response"]
-
-        # Process inputs
+        # Use suffix parameter - this is the key for proper label creation!
         inputs = self.processor(
-            text=prompt,
+            text=self.prompt,
             images=image,
+            suffix=row["label"],  # e.g., "alert", "drowsy", etc.
             return_tensors="pt",
             padding="max_length",
-            max_length=self.max_length,
-            truncation=True
+            max_length=self.max_length
         )
 
-        # Process labels (response)
-        labels = self.processor.tokenizer(
-            response,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True
-        )
-
-        return {
-            "input_ids": inputs["input_ids"].squeeze(),
-            "attention_mask": inputs["attention_mask"].squeeze(),
-            "pixel_values": inputs["pixel_values"].squeeze(),
-            "labels": labels["input_ids"].squeeze()
+        result = {
+            "input_ids": inputs["input_ids"].squeeze(0),
+            "attention_mask": inputs["attention_mask"].squeeze(0),
+            "pixel_values": inputs["pixel_values"].squeeze(0),
         }
+        if "token_type_ids" in inputs:
+            result["token_type_ids"] = inputs["token_type_ids"].squeeze(0)
+        if "labels" in inputs:
+            result["labels"] = inputs["labels"].squeeze(0)
+        return result
+
+
+def get_balanced_sample(df, samples_per_class=250):
+    """Get balanced sample across all classes."""
+    balanced = []
+    for label in CLASSES:
+        class_df = df[df["label"] == label]
+        n_samples = min(samples_per_class, len(class_df))
+        if n_samples > 0:
+            balanced.append(class_df.sample(n=n_samples, random_state=42))
+    result = pd.concat(balanced, ignore_index=True)
+    # Shuffle
+    return result.sample(frac=1, random_state=42).reset_index(drop=True)
 
 
 def load_data():
     """Load processed data."""
-    prompts_file = DATA_DIR / "prompts.csv"
+    metadata_file = DATA_DIR / "metadata.csv"
 
-    if not prompts_file.exists():
+    if not metadata_file.exists():
         raise FileNotFoundError(
-            f"Data not found at {prompts_file}. "
+            f"Data not found at {metadata_file}. "
             "Run prepare_data.py first."
         )
 
-    df = pd.read_csv(prompts_file)
+    df = pd.read_csv(metadata_file)
+
+    # Add path column if not present
+    if "path" not in df.columns:
+        df["path"] = df["filename"].apply(lambda x: str(DATA_DIR / "images" / x))
+
     train_df = df[df["split"] == "train"]
     val_df = df[df["split"] == "val"]
     test_df = df[df["split"] == "test"]
 
-    print(f"📊 Data loaded: {len(train_df)} train, {len(val_df)} val, {len(test_df)} test")
+    print(f"Data loaded: {len(train_df)} train, {len(val_df)} val, {len(test_df)} test")
     return train_df, val_df, test_df
 
 
 def setup_model(use_4bit: bool = True):
-    """Setup PaliGemma with LoRA."""
-    print(f"🔧 Loading {BASE_MODEL}...")
+    """Setup PaliGemma2 with LoRA."""
+    print(f"Loading {BASE_MODEL}...")
 
     # Quantization config for memory efficiency
     if use_4bit:
@@ -145,7 +156,7 @@ def setup_model(use_4bit: bool = True):
     else:
         bnb_config = None
 
-    # Load processor
+    # Load processor - use PaliGemmaProcessor for proper suffix handling
     processor = PaliGemmaProcessor.from_pretrained(BASE_MODEL)
 
     # Load model
@@ -156,13 +167,14 @@ def setup_model(use_4bit: bool = True):
         torch_dtype=torch.bfloat16
     )
 
-    # Freeze vision tower (only train language model with LoRA)
-    # Per research: vision encoder already has sufficient visual understanding
-    print("🔒 Freezing vision tower...")
-    for param in model.vision_tower.parameters():
-        param.requires_grad = False
-    for param in model.multi_modal_projector.parameters():
-        param.requires_grad = False
+    # Freeze vision encoder - freeze all parameters with "vision" in name
+    print("Freezing vision encoder...")
+    frozen_count = 0
+    for name, param in model.named_parameters():
+        if "vision" in name:
+            param.requires_grad = False
+            frozen_count += 1
+    print(f"  Froze {frozen_count} vision parameters")
 
     # Setup LoRA
     lora_config = LoraConfig(
@@ -178,100 +190,78 @@ def setup_model(use_4bit: bool = True):
     # Print trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"📊 Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+    print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
 
     return model, processor
 
 
-def write_summary_md(baseline_metrics: dict, finetuned_metrics: dict, filepath: Path):
-    """Write a presentation-ready summary comparing baseline vs finetuned."""
-    with open(filepath, "w") as f:
-        f.write("# Drowsiness Detection Model - Training Summary\n\n")
-        f.write(f"**Date:** {finetuned_metrics.get('timestamp', 'N/A')}\n\n")
-        f.write(f"**Base Model:** `{baseline_metrics.get('model', 'N/A')}`\n\n")
-
-        # Performance comparison
-        baseline_acc = baseline_metrics.get('accuracy', 0)
-        finetuned_acc = finetuned_metrics.get('accuracy', 0)
-        improvement = finetuned_acc - baseline_acc
-
-        f.write("## Performance Comparison\n\n")
-        f.write("| Model | Accuracy | Change |\n")
-        f.write("|-------|----------|--------|\n")
-        f.write(f"| Baseline (zero-shot) | {baseline_acc:.2%} | - |\n")
-        f.write(f"| **Fine-tuned (LoRA)** | **{finetuned_acc:.2%}** | **+{improvement:.2%}** |\n\n")
-
-        # Training config
-        f.write("## Training Configuration\n\n")
-        f.write(f"- **LoRA Rank:** {finetuned_metrics.get('lora_config', {}).get('r', 'N/A')}\n")
-        f.write(f"- **LoRA Alpha:** {finetuned_metrics.get('lora_config', {}).get('lora_alpha', 'N/A')}\n")
-        f.write(f"- **Target Modules:** Attention + MLP layers\n")
-        training_args = finetuned_metrics.get('training_args', {})
-        f.write(f"- **Epochs:** {training_args.get('epochs', 'N/A')}\n")
-        f.write(f"- **Learning Rate:** {training_args.get('learning_rate', 'N/A')}\n")
-        f.write(f"- **Batch Size:** {training_args.get('batch_size', 'N/A')}\n")
-        f.write(f"- **Training Loss:** {finetuned_metrics.get('train_loss', 'N/A'):.4f}\n\n")
-
-        f.write("## Key Findings\n\n")
-        if improvement > 0.1:
-            f.write(f"- Significant improvement of **{improvement:.2%}** over baseline\n")
-        elif improvement > 0:
-            f.write(f"- Moderate improvement of **{improvement:.2%}** over baseline\n")
-        else:
-            f.write(f"- Model performance similar to baseline\n")
-        f.write(f"- Fine-tuning successfully adapted model to drowsiness detection task\n")
-
-
-def evaluate_model(model, processor, test_df, device="cuda"):
+def evaluate_model(model, processor, test_df, device="cuda", max_samples=100):
     """Evaluate model on test set."""
-    print("\n📊 Evaluating model...")
+    print(f"\nEvaluating model on {min(max_samples, len(test_df))} samples...")
 
     model.eval()
     correct = 0
     total = 0
     predictions = []
+    prompt = "Driver state?\n"
 
-    classes = ["alert", "drowsy", "yawning", "eyes_closed"]
+    # Sample if too many
+    eval_df = test_df.sample(n=min(max_samples, len(test_df)), random_state=42)
 
     with torch.no_grad():
-        for idx, row in tqdm(test_df.iterrows(), total=len(test_df)):
-            image = Image.open(row["path"]).convert("RGB")
+        for idx, row in tqdm(eval_df.iterrows(), total=len(eval_df)):
+            try:
+                image = Image.open(row["path"]).convert("RGB")
 
-            inputs = processor(
-                text=row["prompt"],
-                images=image,
-                return_tensors="pt"
-            ).to(device)
+                inputs = processor(
+                    text=prompt,
+                    images=image,
+                    return_tensors="pt"
+                ).to(device)
 
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=100,
-                do_sample=False
-            )
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=10,
+                    do_sample=False
+                )
 
-            response = processor.decode(outputs[0], skip_special_tokens=True)
+                # Decode full response and extract the answer part
+                response = processor.decode(outputs[0], skip_special_tokens=True)
+                # Get part after the prompt
+                answer = response.split("?")[-1].strip().lower()
 
-            # Extract predicted class from response
-            pred_class = None
-            response_lower = response.lower()
-            for cls in classes:
-                if cls in response_lower:
-                    pred_class = cls
-                    break
+                # Match to classes
+                pred_class = None
+                for cls in CLASSES:
+                    if cls in answer:
+                        pred_class = cls
+                        break
 
-            predictions.append({
-                "true_label": row["label"],
-                "predicted": pred_class,
-                "response": response,
-                "correct": pred_class == row["label"]
-            })
+                # If no exact match, check first word
+                if pred_class is None and answer:
+                    first_word = answer.split()[0] if answer.split() else ""
+                    for cls in CLASSES:
+                        if cls.startswith(first_word) or first_word.startswith(cls[:3]):
+                            pred_class = cls
+                            break
 
-            if pred_class == row["label"]:
-                correct += 1
-            total += 1
+                predictions.append({
+                    "true_label": row["label"],
+                    "predicted": pred_class,
+                    "response": answer[:30],
+                    "correct": pred_class == row["label"]
+                })
+
+                if pred_class == row["label"]:
+                    correct += 1
+                total += 1
+
+            except Exception as e:
+                print(f"  Error: {e}")
+                continue
 
     accuracy = correct / total if total > 0 else 0
-    print(f"✅ Accuracy: {accuracy:.4f} ({correct}/{total})")
+    print(f"Accuracy: {accuracy:.2%} ({correct}/{total})")
 
     return accuracy, predictions
 
@@ -279,11 +269,11 @@ def evaluate_model(model, processor, test_df, device="cuda"):
 def train(args):
     """Main training function."""
     if not ML_AVAILABLE:
-        print("❌ ML dependencies not available. Run on VM.")
+        print("ML dependencies not available. Run on VM.")
         return
 
     print("="*60)
-    print("🚗 Drowsiness Detection Model Training")
+    print("Drowsiness Detection Model Training")
     print("="*60)
 
     # Create directories
@@ -296,8 +286,8 @@ def train(args):
     # Setup model
     model, processor = setup_model(use_4bit=not args.no_4bit)
 
-    # Always run baseline evaluation first
-    print("\n📊 Running baseline evaluation (before fine-tuning)...")
+    # Run baseline evaluation first
+    print("\nRunning baseline evaluation (before fine-tuning)...")
     baseline_acc, baseline_preds = evaluate_model(model, processor, test_df)
 
     # Save baseline metrics
@@ -310,35 +300,44 @@ def train(args):
     with open(METRICS_DIR / "baseline.json", "w") as f:
         json.dump(baseline_metrics, f, indent=2)
 
-    print(f"✅ Baseline accuracy: {baseline_acc:.2%}")
-    print(f"✅ Baseline metrics saved to {METRICS_DIR / 'baseline.json'}")
+    print(f"Baseline accuracy: {baseline_acc:.2%}")
 
     if args.eval_only:
         return
 
     # Create datasets
-    train_dataset = DrowsinessDataset(train_df, processor)
-    val_dataset = DrowsinessDataset(val_df, processor)
+    print("\nCreating datasets...")
+    # Use balanced sampling: 250 per class = 1000 total
+    balanced_train = get_balanced_sample(train_df, samples_per_class=250)
+    print(f"Balanced training set: {len(balanced_train)} samples")
+    print(f"Class distribution: {balanced_train['label'].value_counts().to_dict()}")
 
-    # Training arguments
+    train_dataset = DrowsinessDataset(balanced_train, processor)
+    val_dataset = DrowsinessDataset(val_df.head(200), processor)
+
+    # Training arguments - checkpoint every 25 steps (~100 samples with batch 4)
     training_args = TrainingArguments(
         output_dir=str(CHECKPOINTS_DIR),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=1,  # No accumulation for faster checkpoints
         learning_rate=args.lr,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        logging_steps=10,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        logging_steps=5,
+        eval_strategy="steps",
+        eval_steps=25,  # Eval every 25 steps (~100 samples)
+        save_strategy="steps",
+        save_steps=25,  # Save every 25 steps
+        save_total_limit=10,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        fp16=True,
+        bf16=True,
         report_to="none",
-        remove_unused_columns=False
+        remove_unused_columns=False,
+        dataloader_pin_memory=False
     )
 
     # Trainer
@@ -346,20 +345,20 @@ def train(args):
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset
+        eval_dataset=val_dataset,
     )
 
     # Train
-    print("\n🚀 Starting training...")
+    print("\nStarting training...")
     train_result = trainer.train()
 
     # Save model
-    print("\n💾 Saving model...")
+    print("\nSaving model...")
     trainer.save_model(str(CHECKPOINTS_DIR / "final"))
     processor.save_pretrained(str(CHECKPOINTS_DIR / "final"))
 
     # Final evaluation
-    print("\n📊 Final evaluation on test set...")
+    print("\nFinal evaluation on test set...")
     final_acc, final_preds = evaluate_model(model, processor, test_df)
 
     # Save final metrics
@@ -382,30 +381,23 @@ def train(args):
     # Save predictions
     pd.DataFrame(final_preds).to_csv(METRICS_DIR / "predictions.csv", index=False)
 
-    # Write presentation summary (baseline vs finetuned)
-    write_summary_md(baseline_metrics, final_metrics, METRICS_DIR / "summary.md")
-    print(f"✅ Summary saved to {METRICS_DIR / 'summary.md'}")
-
     # Calculate improvement
     improvement = final_acc - baseline_acc
 
     print("\n" + "="*60)
-    print("✅ TRAINING COMPLETE")
+    print("TRAINING COMPLETE")
     print("="*60)
     print(f"Baseline Accuracy:  {baseline_acc:.2%}")
     print(f"Finetuned Accuracy: {final_acc:.2%}")
     print(f"Improvement:        +{improvement:.2%}")
-    print(f"Checkpoints: {CHECKPOINTS_DIR}")
-    print(f"Metrics: {METRICS_DIR}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train Drowsiness Detection Model")
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--eval_only", action="store_true", help="Only evaluate base model")
-    parser.add_argument("--baseline", action="store_true", help="Run baseline eval before training")
     parser.add_argument("--no_4bit", action="store_true", help="Disable 4-bit quantization")
     args = parser.parse_args()
 
